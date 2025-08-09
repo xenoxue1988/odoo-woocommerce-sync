@@ -12,6 +12,7 @@ from odoo.exceptions import UserError, ValidationError
 from odoo.release import version_info
 
 from woocommerce import API
+from odoo.addons.queue_job.job import job
 
 # Settings
 _logger = logging.getLogger(__name__)
@@ -173,11 +174,7 @@ class WoocommerceConnector(models.Model):
             cron_values = {
                 'name': f'WooCommerce Auto-Sync - {self.settings_woocommerce_connection_url}',
                 'model_id': self.env['ir.model']._get(self._name).id,
-                'code': (
-                    f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()'
-                    if self.env['ir.module.module'].search([('name', '=', 'queue_job'), ('state', '=', 'installed')], limit=1)
-                    else f'model.with_context(cron_running=True).browse({self.id}).woocommerce_sync()'
-                ),
+                'code': f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()',
                 'active': self.settings_woocommerce_sync_scheduled,
                 'interval_number': self.settings_woocommerce_sync_scheduled_interval_minutes,
                 'interval_type': 'minutes',
@@ -189,11 +186,7 @@ class WoocommerceConnector(models.Model):
             cron_values = {
                 'name': f'WooCommerce Auto-Sync - {self.settings_woocommerce_connection_url}',
                 'model_id': self.env['ir.model']._get(self._name).id,
-                'code': (
-                    f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()'
-                    if self.env['ir.module.module'].search([('name', '=', 'queue_job'), ('state', '=', 'installed')], limit=1)
-                    else f'model.with_context(cron_running=True).browse({self.id}).woocommerce_sync()'
-                ),
+                'code': f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()',
                 'active': self.settings_woocommerce_sync_scheduled,
                 'interval_number': self.settings_woocommerce_sync_scheduled_interval_minutes,
                 'interval_type': 'minutes',
@@ -210,34 +203,20 @@ class WoocommerceConnector(models.Model):
         self.ensure_one()
         _logger.info("Manual 'Sync Now' button pressed, triggering background sync.")
 
-        # Run woocommerce_sync in the background (requires 'queue_job' add-on)
-        if self.env['ir.module.module'].search([('name', '=', 'queue_job'), ('state', '=', 'installed')], limit=1):
-            self.with_delay().woocommerce_sync()
+        self.with_delay().woocommerce_sync()
 
-            return {
-                'type': 'ir.actions.client',
-                'tag': 'display_notification',
-                'params': {
-                    'title': _('Sync Started (Queue Job)'),
-                    'message': _('WooCommerce sync process has been started in the background. %s'),
-                    'links': [{'label': _('Open Job Queue'), 'url': '/web#action=%d&model=queue.job&view_type=list' % self.env['ir.actions.act_window'].search([('res_model', '=', 'queue.job')], limit=1).id}],
-                    'sticky': False,
-                },
-            }
+        return {
+            'type': 'ir.actions.client',
+            'tag': 'display_notification',
+            'params': {
+                'title': _('Sync Started (Queue Job)'),
+                'message': _('WooCommerce sync process has been started in the background. %s'),
+                'links': [{'label': _('Open Job Queue'), 'url': '/web#action=%d&model=queue.job&view_type=list' % self.env['ir.actions.act_window'].search([('res_model', '=', 'queue.job')], limit=1).id}],
+                'sticky': False,
+            },
+        }
 
-        else:
-            self.woocommerce_sync()
-
-            return {
-                'type': 'ir.actions.client',
-                'tag': 'display_notification',
-                'params': {
-                    'title': _('Sync Started (Synchronous)'),
-                    'message': _('WooCommerce sync process has been started and is running synchronously.'),
-                    'sticky': False,
-                },
-            }
-
+    @job
     def woocommerce_sync(self: models.Model) -> None:
         self.ensure_one()
 
@@ -271,7 +250,7 @@ class WoocommerceConnector(models.Model):
 
         ## Products
         if self.settings_woocommerce_to_odoo_products_sync:
-            self.woocommerce_to_odoo_products_sync(
+            self.with_delay(priority=20).split(50).woocommerce_to_odoo_products_sync(
                 woocommerce_api,
                 woocommerce_currency,
                 woocommerce_tax_rates,
@@ -282,7 +261,7 @@ class WoocommerceConnector(models.Model):
 
         ## Product variations
         if self.settings_woocommerce_to_odoo_products_sync and self.settings_woocommerce_to_odoo_product_variations_sync:
-            self.woocommerce_to_odoo_products_variations_sync(
+            self.with_delay(priority=30).split(50).woocommerce_to_odoo_products_variations_sync(
                 woocommerce_api,
                 woocommerce_currency,
                 woocommerce_tax_rates,
@@ -297,17 +276,22 @@ class WoocommerceConnector(models.Model):
 
         ## Customers
         if self.settings_woocommerce_to_odoo_customers_sync:
-            self.woocommerce_to_odoo_customers_sync(woocommerce_api)
+            self.with_delay(priority=40).split(50).woocommerce_to_odoo_customers_sync(woocommerce_api)
 
         ## Orders
         if self.settings_woocommerce_to_odoo_orders_sync:
-            self.woocommerce_to_odoo_orders_sync(woocommerce_api, woocommerce_tax_rates, woocommerce_weight_unit, woocommerce_shipping_methods)
+            self.with_delay(priority=50).split(50).woocommerce_to_odoo_orders_sync(
+                woocommerce_api,
+                woocommerce_tax_rates,
+                woocommerce_weight_unit,
+                woocommerce_shipping_methods,
+            )
 
         # Odoo to WooCommerce
 
         ## Products
         if self.settings_odoo_to_woocommerce_products_sync:
-            self.odoo_to_woocommerce_products_sync(
+            self.with_delay(priority=60).split(50).odoo_to_woocommerce_products_sync(
                 woocommerce_api,
                 woocommerce_currency,
                 woocommerce_tax_rates,
@@ -318,7 +302,7 @@ class WoocommerceConnector(models.Model):
 
         # Stock
         if self.settings_woocommerce_products_stock_management:
-            self.product_stock_quantity_create_or_update(woocommerce_api)
+            self.with_delay(priority=70).split(50).product_stock_quantity_create_or_update(woocommerce_api)
 
         # Store 'woocommerce_last_synced'
         woocommerce_sync_log = self.env['woocommerce.sync.log'].search([], limit=1)
@@ -706,6 +690,7 @@ class WoocommerceConnector(models.Model):
 
         return odoo_delivery_carrier
 
+    @job
     def product_stock_quantity_create_or_update(self: models.Model, woocommerce_api: API) -> None:
         """Synchronize stock quantity levels between WooCommerce and Odoo using 'product.product records'. In WooCommerce, if a stock quantity level changes due to a purchase, the 'date_modified_gmt' field is updated accordingly."""
         # Retrieve WooCommerce products with stock management enabled
@@ -923,6 +908,7 @@ class WoocommerceConnector(models.Model):
 
         return product_values
 
+    @job
     def woocommerce_to_odoo_products_sync(
         self: models.Model,
         woocommerce_api: API,
@@ -1243,6 +1229,7 @@ class WoocommerceConnector(models.Model):
 
         return product_variation_values
 
+    @job
     def woocommerce_to_odoo_products_variations_sync(
         self: models.Model,
         woocommerce_api: API,
@@ -1443,6 +1430,7 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing product {woocommerce_product["id"]}: {error}')
 
+    @job
     def woocommerce_to_odoo_customers_sync(self: models.Model, woocommerce_api: API) -> None:
         # WooCommerce REST API parameters
         search_parameters = {}
@@ -1606,6 +1594,7 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing customer {woocommerce_customer["id"]}: {error}')
 
+    @job
     def woocommerce_to_odoo_orders_sync(self: models.Model, woocommerce_api: API, woocommerce_tax_rates: dict[str, float], woocommerce_weight_unit: str, woocommerce_shipping_methods: list[dict[str, Any]]) -> None:
         # WooCommerce REST API parameters
         search_parameters = {'status': ','.join(self.settings_woocommerce_order_status.mapped('status')) or 'any'}
@@ -2064,6 +2053,7 @@ class WoocommerceConnector(models.Model):
 
             return woocommerce_api.post(f'products/{attribute_type}', data=data).json()
 
+    @job
     def odoo_to_woocommerce_products_sync(
         self: models.Model,
         woocommerce_api: API,
