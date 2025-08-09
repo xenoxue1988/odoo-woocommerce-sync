@@ -1,5 +1,4 @@
 from odoo import api, fields, models
-from odoo.release import version_info
 
 
 # Account Move Line
@@ -37,28 +36,15 @@ class StockMove(models.Model):
     _inherit = 'stock.move'
 
     # Override the existing 'product_id' field to add the ondelete cascade
-    if version_info[0] == 16:
-        product_id = fields.Many2one(
-            comodel_name='product.product',
-            string='Product',
-            check_company=True,
-            domain="[('type', 'in', ['product', 'consu']), '|', ('company_id', '=', False), ('company_id', '=', company_id)]",
-            required=True,
-            index=True,
-            states={'done': [('readonly', True)]},
-            ondelete='cascade',
-        )
-
-    elif version_info[0] == 18:
-        product_id = fields.Many2one(
-            comodel_name='product.product',
-            string='Product',
-            check_company=True,
-            domain="[('type', '=', 'consu')]",
-            required=True,
-            index=True,
-            ondelete='cascade',
-        )
+    product_id = fields.Many2one(
+        comodel_name='product.product',
+        string='Product',
+        check_company=True,
+        domain="[('is_storable', '=', True)]",
+        required=True,
+        index=True,
+        ondelete='cascade',
+    )
 
 
 class StockValuationLayer(models.Model):

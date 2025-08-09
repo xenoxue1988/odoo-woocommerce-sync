@@ -9,7 +9,6 @@ from typing import Any
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
-from odoo.release import version_info
 
 from woocommerce import API
 
@@ -169,35 +168,18 @@ class WoocommerceConnector(models.Model):
     def cron_job_update(self: models.Model) -> None:
         self.ensure_one()
 
-        if version_info[0] == 16:
-            cron_values = {
-                'name': f'WooCommerce Auto-Sync - {self.settings_woocommerce_connection_url}',
-                'model_id': self.env['ir.model']._get(self._name).id,
-                'code': (
-                    f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()'
-                    if self.env['ir.module.module'].search([('name', '=', 'queue_job'), ('state', '=', 'installed')], limit=1)
-                    else f'model.with_context(cron_running=True).browse({self.id}).woocommerce_sync()'
-                ),
-                'active': self.settings_woocommerce_sync_scheduled,
-                'interval_number': self.settings_woocommerce_sync_scheduled_interval_minutes,
-                'interval_type': 'minutes',
-                'numbercall': -1,
-                'doall': True,
-            }
-
-        elif version_info[0] == 18:
-            cron_values = {
-                'name': f'WooCommerce Auto-Sync - {self.settings_woocommerce_connection_url}',
-                'model_id': self.env['ir.model']._get(self._name).id,
-                'code': (
-                    f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()'
-                    if self.env['ir.module.module'].search([('name', '=', 'queue_job'), ('state', '=', 'installed')], limit=1)
-                    else f'model.with_context(cron_running=True).browse({self.id}).woocommerce_sync()'
-                ),
-                'active': self.settings_woocommerce_sync_scheduled,
-                'interval_number': self.settings_woocommerce_sync_scheduled_interval_minutes,
-                'interval_type': 'minutes',
-            }
+        cron_values = {
+            'name': f'WooCommerce Auto-Sync - {self.settings_woocommerce_connection_url}',
+            'model_id': self.env['ir.model']._get(self._name).id,
+            'code': (
+                f'model.with_context(cron_running=True).browse({self.id}).with_delay().woocommerce_sync()'
+                if self.env['ir.module.module'].search([('name', '=', 'queue_job'), ('state', '=', 'installed')], limit=1)
+                else f'model.with_context(cron_running=True).browse({self.id}).woocommerce_sync()'
+            ),
+            'active': self.settings_woocommerce_sync_scheduled,
+            'interval_number': self.settings_woocommerce_sync_scheduled_interval_minutes,
+            'interval_type': 'minutes',
+        }
 
         # Update the existing cron job
         if self.ir_cron_id:
@@ -713,15 +695,14 @@ class WoocommerceConnector(models.Model):
         woocommerce_products_stock_map = {product['id']: product for product in woocommerce_products}
 
         # Fetch all Odoo 'product.product' records linked to WooCommerce
-        if version_info[0] == 16:
-            odoo_products = self.env['product.product'].search(
-                [('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url), ('active', '=', True), ('woocommerce_product_id', '!=', False), ('detailed_type', '=', 'product')],
-            )
-
-        elif version_info[0] == 18:
-            odoo_products = self.env['product.product'].search(
-                [('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url), ('active', '=', True), ('woocommerce_product_id', '!=', False), ('is_storable', '=', True)],
-            )
+        odoo_products = self.env['product.product'].search(
+            [
+                ('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url),
+                ('active', '=', True),
+                ('woocommerce_product_id', '!=', False),
+                ('is_storable', '=', True),
+            ],
+        )
 
         for odoo_product in odoo_products:
             # Determine the corresponding WooCommerce stock info
@@ -1082,12 +1063,8 @@ class WoocommerceConnector(models.Model):
                 )
 
                 # Product type
-                if version_info[0] == 16:
-                    product_values['detailed_type'] = 'service' if product_values['woocommerce_product_service'] else 'product' if product_values['woocommerce_product_manage_stock'] else 'consu'
-
-                elif version_info[0] == 18:
-                    product_values['type'] = 'service' if product_values['woocommerce_product_service'] else 'consu'
-                    product_values['is_storable'] = True if product_values['woocommerce_product_manage_stock'] else False
+                product_values['type'] = 'service' if product_values['woocommerce_product_service'] else 'consu'
+                product_values['is_storable'] = True if product_values['woocommerce_product_manage_stock'] else False
 
                 if odoo_product:
                     odoo_product.write(product_values)
@@ -1103,7 +1080,7 @@ class WoocommerceConnector(models.Model):
                     if attachment_ids:
                         odoo_product.write({'product_image_ids': [(6, 0, attachment_ids)]})
 
-                    if version_info[0] == 18 and self.env['ir.module.module'].search([('name', '=', 'website_sale'), ('state', '=', 'installed')], limit=1):
+                    if self.env['ir.module.module'].search([('name', '=', 'website_sale'), ('state', '=', 'installed')], limit=1):
                         image_values_list = self.image_process_attachments(woocommerce_product['images'], odoo_product, create_attachments=False)
                         if image_values_list:
                             # Clear the gallery ((5, 0, 0)), then create new images ((0, 0, {vals}))
@@ -1394,14 +1371,8 @@ class WoocommerceConnector(models.Model):
                         )
 
                         # Product type
-                        if version_info[0] == 16:
-                            product_variation_values['detailed_type'] = (
-                                'service' if product_variation_values['woocommerce_product_variation_service'] else 'product' if product_variation_values['woocommerce_product_variation_manage_stock'] else 'consu'
-                            )
-
-                        elif version_info[0] == 18:
-                            product_variation_values['type'] = 'service' if product_variation_values['woocommerce_product_variation_service'] else 'consu'
-                            product_variation_values['is_storable'] = True if product_variation_values['woocommerce_product_variation_manage_stock'] else False
+                        product_variation_values['type'] = 'service' if product_variation_values['woocommerce_product_variation_service'] else 'consu'
+                        product_variation_values['is_storable'] = True if product_variation_values['woocommerce_product_variation_manage_stock'] else False
 
                         # Update the product template so that all attribute lines are considered and variants are created
                         odoo_product._create_variant_ids()
@@ -2125,11 +2096,7 @@ class WoocommerceConnector(models.Model):
                     }
 
                     # Manage stock
-                    if version_info[0] == 16:
-                        product_values['manage_stock'] = True if odoo_product.detailed_type == 'product' else False
-
-                    elif version_info[0] == 18:
-                        product_values['manage_stock'] = True if odoo_product.is_storable else False
+                    product_values['manage_stock'] = True if odoo_product.is_storable else False
 
                     # Check if product has multiple variants
                     if len(odoo_product.product_variant_ids) > 1:
@@ -2253,11 +2220,7 @@ class WoocommerceConnector(models.Model):
                             }
 
                             # Manage stock
-                            if version_info[0] == 16:
-                                variation_data['manage_stock'] = True if odoo_product.detailed_type == 'product' else False
-
-                            elif version_info[0] == 18:
-                                variation_data['manage_stock'] = True if odoo_product.is_storable else False
+                            variation_data['manage_stock'] = True if odoo_product.is_storable else False
 
                             # Check if a variation with this SKU already exists
                             variation_existing = variations_by_sku.get(odoo_product_variant.default_code)
