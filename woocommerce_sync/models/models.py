@@ -9,6 +9,7 @@ from typing import Any
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
+from odoo.addons.queue_job.job import job
 
 from woocommerce import API
 
@@ -188,6 +189,12 @@ class WoocommerceConnector(models.Model):
         elif self.settings_woocommerce_sync_scheduled:
             self.ir_cron_id = self.env['ir.cron'].create(cron_values)
 
+    @staticmethod
+    def _chunk(seq: list[Any], size: int) -> list[list[Any]]:
+        """Yield successive chunks from a list."""
+        for pos in range(0, len(seq), size):
+            yield seq[pos : pos + size]
+
     def woocommerce_sync_action(self: models.Model) -> dict[str, Any]:
         self.ensure_one()
         _logger.info("Manual 'Sync Now' button pressed, triggering background sync.")
@@ -249,29 +256,59 @@ class WoocommerceConnector(models.Model):
         ## WooCommerce shipping methods
         woocommerce_shipping_methods = woocommerce_api.get(endpoint='shipping_methods').json()
 
+        woocommerce_last_execution_datetime = (
+            self.woocommerce_last_execution_datetime()
+            if self.settings_woocommerce_modified_records_import
+            else None
+        )
+
         # WooCommerce to Odoo
 
         ## Products
         if self.settings_woocommerce_to_odoo_products_sync:
-            self.woocommerce_to_odoo_products_sync(
-                woocommerce_api,
-                woocommerce_currency,
-                woocommerce_tax_rates,
-                woocommerce_product_prices_include_tax,
-                woocommerce_weight_unit,
-                woocommerce_dimension_unit,
+            product_search_parameters = {'status': 'publish'}
+            if woocommerce_last_execution_datetime:
+                product_search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
+            if self.settings_woocommerce_to_odoo_products_language_code:
+                product_search_parameters['lang'] = self.settings_woocommerce_to_odoo_products_language_code
+            woocommerce_products_all = self.woocommerce_api_get_all_items(
+                woocommerce_api, endpoint='products', search_parameters=product_search_parameters
             )
+            product_ids = [p['id'] for p in woocommerce_products_all if p['sku']]
+            for batch in self._chunk(product_ids, 50):
+                self.with_delay().woocommerce_to_odoo_products_sync_batch(
+                    batch,
+                    woocommerce_currency,
+                    woocommerce_tax_rates,
+                    woocommerce_product_prices_include_tax,
+                    woocommerce_weight_unit,
+                    woocommerce_dimension_unit,
+                )
 
         ## Product variations
         if self.settings_woocommerce_to_odoo_products_sync and self.settings_woocommerce_to_odoo_product_variations_sync:
-            self.woocommerce_to_odoo_products_variations_sync(
-                woocommerce_api,
-                woocommerce_currency,
-                woocommerce_tax_rates,
-                woocommerce_product_prices_include_tax,
-                woocommerce_weight_unit,
-                woocommerce_dimension_unit,
+            variation_search_parameters = {
+                'status': 'publish',
+                'fields': 'id,variations',
+                'type': 'variable',
+            }
+            if woocommerce_last_execution_datetime:
+                variation_search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
+            if self.settings_woocommerce_to_odoo_products_language_code:
+                variation_search_parameters['lang'] = self.settings_woocommerce_to_odoo_products_language_code
+            variable_products = self.woocommerce_api_get_all_items(
+                woocommerce_api, endpoint='products', search_parameters=variation_search_parameters
             )
+            variation_ids = [p['id'] for p in variable_products if p['sku']]
+            for batch in self._chunk(variation_ids, 50):
+                self.with_delay().woocommerce_to_odoo_products_variations_sync_batch(
+                    batch,
+                    woocommerce_currency,
+                    woocommerce_tax_rates,
+                    woocommerce_product_prices_include_tax,
+                    woocommerce_weight_unit,
+                    woocommerce_dimension_unit,
+                )
 
         ## Products related ids map
         if self.settings_woocommerce_products_related_ids_map:
@@ -279,11 +316,34 @@ class WoocommerceConnector(models.Model):
 
         ## Customers
         if self.settings_woocommerce_to_odoo_customers_sync:
-            self.woocommerce_to_odoo_customers_sync(woocommerce_api)
+            customer_search_parameters = {}
+            if woocommerce_last_execution_datetime:
+                customer_search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
+            customers_all = self.woocommerce_api_get_all_items(
+                woocommerce_api, endpoint='customers', search_parameters=customer_search_parameters
+            )
+            customer_ids = [c['id'] for c in customers_all]
+            for batch in self._chunk(customer_ids, 50):
+                self.with_delay().woocommerce_to_odoo_customers_sync_batch(batch)
 
         ## Orders
         if self.settings_woocommerce_to_odoo_orders_sync:
-            self.woocommerce_to_odoo_orders_sync(woocommerce_api, woocommerce_tax_rates, woocommerce_weight_unit, woocommerce_shipping_methods)
+            order_search_parameters = {
+                'status': ','.join(self.settings_woocommerce_order_status.mapped('status')) or 'any'
+            }
+            if woocommerce_last_execution_datetime:
+                order_search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
+            orders_all = self.woocommerce_api_get_all_items(
+                woocommerce_api, endpoint='orders', search_parameters=order_search_parameters
+            )
+            order_ids = [o['id'] for o in orders_all]
+            for batch in self._chunk(order_ids, 50):
+                self.with_delay().woocommerce_to_odoo_orders_sync_batch(
+                    batch,
+                    woocommerce_tax_rates,
+                    woocommerce_weight_unit,
+                    woocommerce_shipping_methods,
+                )
 
         # Odoo to WooCommerce
 
@@ -300,7 +360,16 @@ class WoocommerceConnector(models.Model):
 
         # Stock
         if self.settings_woocommerce_products_stock_management:
-            self.product_stock_quantity_create_or_update(woocommerce_api)
+            odoo_products = self.env['product.product'].search(
+                [
+                    ('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url),
+                    ('active', '=', True),
+                    ('woocommerce_product_id', '!=', False),
+                    ('is_storable', '=', True),
+                ]
+            )
+            for batch in self._chunk(odoo_products.ids, 50):
+                self.with_delay().product_stock_quantity_create_or_update_batch(batch)
 
         # Store 'woocommerce_last_synced'
         woocommerce_sync_log = self.env['woocommerce.sync.log'].search([], limit=1)
@@ -688,21 +757,38 @@ class WoocommerceConnector(models.Model):
 
         return odoo_delivery_carrier
 
-    def product_stock_quantity_create_or_update(self: models.Model, woocommerce_api: API) -> None:
-        """Synchronize stock quantity levels between WooCommerce and Odoo using 'product.product records'. In WooCommerce, if a stock quantity level changes due to a purchase, the 'date_modified_gmt' field is updated accordingly."""
-        # Retrieve WooCommerce products with stock management enabled
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters={'status': 'publish', 'manage_stock': 'true'})
-        woocommerce_products_stock_map = {product['id']: product for product in woocommerce_products}
-
+    def product_stock_quantity_create_or_update(
+        self: models.Model, woocommerce_api: API, product_ids: list[int] | None = None
+    ) -> None:
+        """Synchronize stock quantity levels between WooCommerce and Odoo using 'product.product' records."""
         # Fetch all Odoo 'product.product' records linked to WooCommerce
-        odoo_products = self.env['product.product'].search(
-            [
-                ('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url),
-                ('active', '=', True),
-                ('woocommerce_product_id', '!=', False),
-                ('is_storable', '=', True),
-            ],
+        domain = [
+            ('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url),
+            ('active', '=', True),
+            ('woocommerce_product_id', '!=', False),
+            ('is_storable', '=', True),
+        ]
+        if product_ids:
+            domain.append(('id', 'in', product_ids))
+        odoo_products = self.env['product.product'].search(domain)
+
+        # Retrieve WooCommerce products with stock management enabled for simple products in this batch
+        simple_wc_ids = [
+            int(p.woocommerce_product_id)
+            for p in odoo_products
+            if p.woocommerce_product_id and not p.woocommerce_product_variation_id
+        ]
+        search_params = {'status': 'publish', 'manage_stock': 'true'}
+        if simple_wc_ids:
+            search_params['include'] = ','.join(map(str, simple_wc_ids))
+        woocommerce_products = (
+            self.woocommerce_api_get_all_items(
+                woocommerce_api, endpoint='products', search_parameters=search_params
+            )
+            if simple_wc_ids
+            else []
         )
+        woocommerce_products_stock_map = {product['id']: product for product in woocommerce_products}
 
         for odoo_product in odoo_products:
             # Determine the corresponding WooCommerce stock info
@@ -758,6 +844,13 @@ class WoocommerceConnector(models.Model):
 
                 # Update the stock date updated
                 odoo_product.write({'product_stock_date_updated': self.datetime_convert(woocommerce_product['date_modified_gmt'])})
+
+    @job
+    def product_stock_quantity_create_or_update_batch(self, product_ids: list[int]) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            return
+        self.product_stock_quantity_create_or_update(woocommerce_api, product_ids=product_ids)
 
     def product_variations_stock_retrieve(self: models.Model, woocommerce_api: API, product: models.Model) -> dict[str, Any] | None:
         """Retrieve WooCommerce stock info for a product variation."""
@@ -912,28 +1005,42 @@ class WoocommerceConnector(models.Model):
         woocommerce_product_prices_include_tax: bool,
         woocommerce_weight_unit: str,
         woocommerce_dimension_unit: str,
+        product_ids: list[int] | None = None,
     ) -> None:
         # WooCommerce REST API parameters
         search_parameters = {'status': 'publish'}
 
-        if self.settings_woocommerce_modified_records_import:
-            woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
-            if woocommerce_last_execution_datetime:
-                search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
+        if product_ids:
+            search_parameters['include'] = ','.join(map(str, product_ids))
+        else:
+            if self.settings_woocommerce_modified_records_import:
+                woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
+                if woocommerce_last_execution_datetime:
+                    search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
 
         if self.settings_woocommerce_to_odoo_products_language_code:
             search_parameters['lang'] = self.settings_woocommerce_to_odoo_products_language_code
 
         # WooCommerce woocommerce_products
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters=search_parameters)
+        woocommerce_products = self.woocommerce_api_get_all_items(
+            woocommerce_api, endpoint='products', search_parameters=search_parameters
+        )
 
         # Filter for WooCommerce products that have SKU
-        woocommerce_products = [woocommerce_product for woocommerce_product in woocommerce_products if woocommerce_product['sku']]
+        woocommerce_products = [
+            woocommerce_product for woocommerce_product in woocommerce_products if woocommerce_product['sku']
+        ]
 
         # Get all Odoo products with WooCommerce product ID
+        domain = [
+            ('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url),
+            ('active', '=', True),
+            ('woocommerce_product_id', '!=', False),
+        ]
+        if product_ids:
+            domain.append(('woocommerce_product_id', 'in', list(map(str, product_ids))))
         odoo_products = self.env['product.template'].search_read(
-            [('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url), ('active', '=', True), ('woocommerce_product_id', '!=', False)],
-            fields=['id', 'woocommerce_product_id', 'write_date', 'woocommerce_product_manage_stock', 'active'],
+            domain, fields=['id', 'woocommerce_product_id', 'write_date', 'woocommerce_product_manage_stock', 'active']
         )
         odoo_products = {odoo_product['woocommerce_product_id']: odoo_product for odoo_product in odoo_products}
 
@@ -1091,6 +1198,29 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing product {woocommerce_product["id"]}: {error}')
 
+    @job
+    def woocommerce_to_odoo_products_sync_batch(
+        self,
+        product_ids: list[int],
+        woocommerce_currency: str,
+        woocommerce_tax_rates: dict[str, float],
+        woocommerce_product_prices_include_tax: bool,
+        woocommerce_weight_unit: str,
+        woocommerce_dimension_unit: str,
+    ) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            return
+        self.woocommerce_to_odoo_products_sync(
+            woocommerce_api,
+            woocommerce_currency,
+            woocommerce_tax_rates,
+            woocommerce_product_prices_include_tax,
+            woocommerce_weight_unit,
+            woocommerce_dimension_unit,
+            product_ids=product_ids,
+        )
+
     def woocommerce_to_odoo_product_related_ids(self: models.Model) -> None:
         # Retrieve all Odoo products
         odoo_products = self.env['product.template'].search([('woocommerce_product_site_url', '=', self.settings_woocommerce_connection_url), ('active', '=', True)])
@@ -1228,20 +1358,27 @@ class WoocommerceConnector(models.Model):
         woocommerce_product_prices_include_tax: bool,
         woocommerce_weight_unit: str,
         woocommerce_dimension_unit: str,
+        product_ids: list[int] | None = None,
     ) -> None:
         # WooCommerce REST API parameters
         search_parameters = {'status': 'publish', 'fields': 'id,variations', 'type': 'variable'}
+        woocommerce_last_execution_datetime = None
 
-        if self.settings_woocommerce_modified_records_import:
-            woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
-            if woocommerce_last_execution_datetime:
-                search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
+        if product_ids:
+            search_parameters['include'] = ','.join(map(str, product_ids))
+        else:
+            if self.settings_woocommerce_modified_records_import:
+                woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
+                if woocommerce_last_execution_datetime:
+                    search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
 
         if self.settings_woocommerce_to_odoo_products_language_code:
             search_parameters['lang'] = self.settings_woocommerce_to_odoo_products_language_code
 
         # WooCommerce products
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters=search_parameters)
+        woocommerce_products = self.woocommerce_api_get_all_items(
+            woocommerce_api, endpoint='products', search_parameters=search_parameters
+        )
 
         # Filter for WooCommerce products that have SKU
         woocommerce_products = [woocommerce_product for woocommerce_product in woocommerce_products if woocommerce_product['sku']]
@@ -1414,22 +1551,60 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing product {woocommerce_product["id"]}: {error}')
 
-    def woocommerce_to_odoo_customers_sync(self: models.Model, woocommerce_api: API) -> None:
+    @job
+    def woocommerce_to_odoo_products_variations_sync_batch(
+        self,
+        product_ids: list[int],
+        woocommerce_currency: str,
+        woocommerce_tax_rates: dict[str, float],
+        woocommerce_product_prices_include_tax: bool,
+        woocommerce_weight_unit: str,
+        woocommerce_dimension_unit: str,
+    ) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            return
+        self.woocommerce_to_odoo_products_variations_sync(
+            woocommerce_api,
+            woocommerce_currency,
+            woocommerce_tax_rates,
+            woocommerce_product_prices_include_tax,
+            woocommerce_weight_unit,
+            woocommerce_dimension_unit,
+            product_ids=product_ids,
+        )
+
+    def woocommerce_to_odoo_customers_sync(
+        self: models.Model,
+        woocommerce_api: API,
+        customer_ids: list[int] | None = None,
+    ) -> None:
         # WooCommerce REST API parameters
         search_parameters = {}
 
-        if self.settings_woocommerce_modified_records_import:
-            woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
-            if woocommerce_last_execution_datetime:
-                search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
+        if customer_ids:
+            search_parameters['include'] = ','.join(map(str, customer_ids))
+        else:
+            if self.settings_woocommerce_modified_records_import:
+                woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
+                if woocommerce_last_execution_datetime:
+                    search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
 
         # WooCommerce customers
-        woocommerce_customers = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='customers', search_parameters=search_parameters)
+        woocommerce_customers = self.woocommerce_api_get_all_items(
+            woocommerce_api, endpoint='customers', search_parameters=search_parameters
+        )
 
         # Get all Odoo partners with WooCommerce customer ID
+        domain = [
+            ('woocommerce_customer_site_url', '=', self.settings_woocommerce_connection_url),
+            ('active', '=', True),
+            ('woocommerce_customer_id', '!=', False),
+        ]
+        if customer_ids:
+            domain.append(('woocommerce_customer_id', 'in', list(map(str, customer_ids))))
         odoo_customers = self.env['res.partner'].search_read(
-            [('woocommerce_customer_site_url', '=', self.settings_woocommerce_connection_url), ('active', '=', True), ('woocommerce_customer_id', '!=', False)],
-            fields=['id', 'woocommerce_customer_id', 'write_date', 'active'],
+            domain, fields=['id', 'woocommerce_customer_id', 'write_date', 'active']
         )
         odoo_customers = {odoo_customer['woocommerce_customer_id']: odoo_customer for odoo_customer in odoo_customers}
 
@@ -1577,22 +1752,46 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing customer {woocommerce_customer["id"]}: {error}')
 
-    def woocommerce_to_odoo_orders_sync(self: models.Model, woocommerce_api: API, woocommerce_tax_rates: dict[str, float], woocommerce_weight_unit: str, woocommerce_shipping_methods: list[dict[str, Any]]) -> None:
+    @job
+    def woocommerce_to_odoo_customers_sync_batch(self, customer_ids: list[int]) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            return
+        self.woocommerce_to_odoo_customers_sync(woocommerce_api, customer_ids=customer_ids)
+
+    def woocommerce_to_odoo_orders_sync(
+        self: models.Model,
+        woocommerce_api: API,
+        woocommerce_tax_rates: dict[str, float],
+        woocommerce_weight_unit: str,
+        woocommerce_shipping_methods: list[dict[str, Any]],
+        order_ids: list[int] | None = None,
+    ) -> None:
         # WooCommerce REST API parameters
         search_parameters = {'status': ','.join(self.settings_woocommerce_order_status.mapped('status')) or 'any'}
 
-        if self.settings_woocommerce_modified_records_import:
-            woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
-            if woocommerce_last_execution_datetime:
-                search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
+        if order_ids:
+            search_parameters['include'] = ','.join(map(str, order_ids))
+        else:
+            if self.settings_woocommerce_modified_records_import:
+                woocommerce_last_execution_datetime = self.woocommerce_last_execution_datetime()
+                if woocommerce_last_execution_datetime:
+                    search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')
 
         # WooCommerce orders
-        woocommerce_orders = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='orders', search_parameters=search_parameters)
+        woocommerce_orders = self.woocommerce_api_get_all_items(
+            woocommerce_api, endpoint='orders', search_parameters=search_parameters
+        )
 
         # Get all Odoo sale orders with WooCommerce order ID
+        domain = [
+            ('woocommerce_order_site_url', '=', self.settings_woocommerce_connection_url),
+            ('woocommerce_order_id', '!=', False),
+        ]
+        if order_ids:
+            domain.append(('woocommerce_order_id', 'in', list(map(str, order_ids))))
         odoo_sale_orders = self.env['sale.order'].search_read(
-            [('woocommerce_order_site_url', '=', self.settings_woocommerce_connection_url), ('woocommerce_order_id', '!=', False)],
-            fields=['id', 'woocommerce_order_id', 'write_date'],
+            domain, fields=['id', 'woocommerce_order_id', 'write_date']
         )
         odoo_sale_orders = {odoo_sale_order['woocommerce_order_id']: odoo_sale_order for odoo_sale_order in odoo_sale_orders}
 
@@ -2015,6 +2214,25 @@ class WoocommerceConnector(models.Model):
                 # Roll back changes
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing order {woocommerce_order["id"]}: {error}')
+
+    @job
+    def woocommerce_to_odoo_orders_sync_batch(
+        self,
+        order_ids: list[int],
+        woocommerce_tax_rates: dict[str, float],
+        woocommerce_weight_unit: str,
+        woocommerce_shipping_methods: list[dict[str, Any]],
+    ) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            return
+        self.woocommerce_to_odoo_orders_sync(
+            woocommerce_api,
+            woocommerce_tax_rates,
+            woocommerce_weight_unit,
+            woocommerce_shipping_methods,
+            order_ids=order_ids,
+        )
 
     def woocommerce_attribute_create_or_retrieve(self: models.Model, woocommerce_api: API, attribute_type: str, attribute_name: str, language_code: str | None = None) -> dict[str, Any] | None:
         """Create or retrieve a WooCommerce attribute, brand, category or tag."""
