@@ -254,7 +254,6 @@ class WoocommerceConnector(models.Model):
         ## Products
         if self.settings_woocommerce_to_odoo_products_sync:
             self.woocommerce_to_odoo_products_sync(
-                woocommerce_api,
                 woocommerce_currency,
                 woocommerce_tax_rates,
                 woocommerce_product_prices_include_tax,
@@ -265,7 +264,6 @@ class WoocommerceConnector(models.Model):
         ## Product variations
         if self.settings_woocommerce_to_odoo_products_sync and self.settings_woocommerce_to_odoo_product_variations_sync:
             self.woocommerce_to_odoo_products_variations_sync(
-                woocommerce_api,
                 woocommerce_currency,
                 woocommerce_tax_rates,
                 woocommerce_product_prices_include_tax,
@@ -279,18 +277,17 @@ class WoocommerceConnector(models.Model):
 
         ## Customers
         if self.settings_woocommerce_to_odoo_customers_sync:
-            self.woocommerce_to_odoo_customers_sync(woocommerce_api)
+            self.woocommerce_to_odoo_customers_sync()
 
         ## Orders
         if self.settings_woocommerce_to_odoo_orders_sync:
-            self.woocommerce_to_odoo_orders_sync(woocommerce_api, woocommerce_tax_rates, woocommerce_weight_unit, woocommerce_shipping_methods)
+            self.woocommerce_to_odoo_orders_sync(woocommerce_tax_rates, woocommerce_weight_unit, woocommerce_shipping_methods)
 
         # Odoo to WooCommerce
 
         ## Products
         if self.settings_odoo_to_woocommerce_products_sync:
             self.odoo_to_woocommerce_products_sync(
-                woocommerce_api,
                 woocommerce_currency,
                 woocommerce_tax_rates,
                 woocommerce_product_prices_include_tax,
@@ -300,7 +297,7 @@ class WoocommerceConnector(models.Model):
 
         # Stock
         if self.settings_woocommerce_products_stock_management:
-            self.product_stock_quantity_create_or_update(woocommerce_api)
+            self.product_stock_quantity_create_or_update()
 
         # Store 'woocommerce_last_synced'
         woocommerce_sync_log = self.env['woocommerce.sync.log'].search([], limit=1)
@@ -342,7 +339,14 @@ class WoocommerceConnector(models.Model):
 
         return woocommerce_api
 
-    def woocommerce_api_get_all_items(self: models.Model, woocommerce_api: API, endpoint: str, search_parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def woocommerce_api_get_all_items(self: models.Model, endpoint: str, search_parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            return []
+
+        if search_parameters is None:
+            search_parameters = {}
+
         # Set default records per page if not already provided
         search_parameters.setdefault('per_page', 100)
 
@@ -688,10 +692,17 @@ class WoocommerceConnector(models.Model):
 
         return odoo_delivery_carrier
 
-    def product_stock_quantity_create_or_update(self: models.Model, woocommerce_api: API) -> None:
+    def product_stock_quantity_create_or_update(self: models.Model) -> None:
         """Synchronize stock quantity levels between WooCommerce and Odoo using 'product.product records'. In WooCommerce, if a stock quantity level changes due to a purchase, the 'date_modified_gmt' field is updated accordingly."""
+
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            error_message = 'WooCommerce REST API connection failed.'
+            _logger.error(error_message)
+            raise UserError(_(error_message))
+
         # Retrieve WooCommerce products with stock management enabled
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters={'status': 'publish', 'manage_stock': 'true'})
+        woocommerce_products = self.woocommerce_api_get_all_items(endpoint='products', search_parameters={'status': 'publish', 'manage_stock': 'true'})
         woocommerce_products_stock_map = {product['id']: product for product in woocommerce_products}
 
         # Fetch all Odoo 'product.product' records linked to WooCommerce
@@ -708,7 +719,7 @@ class WoocommerceConnector(models.Model):
             # Determine the corresponding WooCommerce stock info
             if odoo_product.woocommerce_product_variation_id:
                 # For variations, retrieve the specific variation stock
-                woocommerce_stock_info = self.product_variations_stock_retrieve(woocommerce_api, odoo_product)
+                woocommerce_stock_info = self.product_variations_stock_retrieve(odoo_product)
             else:
                 # For simple products, get the stock from the parent product
                 woocommerce_stock_info = woocommerce_products_stock_map.get(int(odoo_product.woocommerce_product_id))
@@ -759,11 +770,10 @@ class WoocommerceConnector(models.Model):
                 # Update the stock date updated
                 odoo_product.write({'product_stock_date_updated': self.datetime_convert(woocommerce_product['date_modified_gmt'])})
 
-    def product_variations_stock_retrieve(self: models.Model, woocommerce_api: API, product: models.Model) -> dict[str, Any] | None:
+    def product_variations_stock_retrieve(self: models.Model, product: models.Model) -> dict[str, Any] | None:
         """Retrieve WooCommerce stock info for a product variation."""
         try:
             variations = self.woocommerce_api_get_all_items(
-                woocommerce_api,
                 endpoint=f'products/{product.woocommerce_product_variation_parent_id}/variations',
                 search_parameters={'status': 'publish', 'manage_stock': 'true'},
             )
@@ -906,13 +916,18 @@ class WoocommerceConnector(models.Model):
 
     def woocommerce_to_odoo_products_sync(
         self: models.Model,
-        woocommerce_api: API,
         woocommerce_currency: str,
         woocommerce_tax_rates: dict[str, float],
         woocommerce_product_prices_include_tax: bool,
         woocommerce_weight_unit: str,
         woocommerce_dimension_unit: str,
     ) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            error_message = 'WooCommerce REST API connection failed.'
+            _logger.error(error_message)
+            raise UserError(_(error_message))
+
         # WooCommerce REST API parameters
         search_parameters = {'status': 'publish'}
 
@@ -925,7 +940,7 @@ class WoocommerceConnector(models.Model):
             search_parameters['lang'] = self.settings_woocommerce_to_odoo_products_language_code
 
         # WooCommerce woocommerce_products
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters=search_parameters)
+        woocommerce_products = self.woocommerce_api_get_all_items(endpoint='products', search_parameters=search_parameters)
 
         # Filter for WooCommerce products that have SKU
         woocommerce_products = [woocommerce_product for woocommerce_product in woocommerce_products if woocommerce_product['sku']]
@@ -1222,13 +1237,18 @@ class WoocommerceConnector(models.Model):
 
     def woocommerce_to_odoo_products_variations_sync(
         self: models.Model,
-        woocommerce_api: API,
         woocommerce_currency: str,
         woocommerce_tax_rates: dict[str, float],
         woocommerce_product_prices_include_tax: bool,
         woocommerce_weight_unit: str,
         woocommerce_dimension_unit: str,
     ) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            error_message = 'WooCommerce REST API connection failed.'
+            _logger.error(error_message)
+            raise UserError(_(error_message))
+
         # WooCommerce REST API parameters
         search_parameters = {'status': 'publish', 'fields': 'id,variations', 'type': 'variable'}
 
@@ -1241,7 +1261,7 @@ class WoocommerceConnector(models.Model):
             search_parameters['lang'] = self.settings_woocommerce_to_odoo_products_language_code
 
         # WooCommerce products
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters=search_parameters)
+        woocommerce_products = self.woocommerce_api_get_all_items(endpoint='products', search_parameters=search_parameters)
 
         # Filter for WooCommerce products that have SKU
         woocommerce_products = [woocommerce_product for woocommerce_product in woocommerce_products if woocommerce_product['sku']]
@@ -1269,7 +1289,7 @@ class WoocommerceConnector(models.Model):
                             search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
 
                     # WooCommerce product variations for the product
-                    woocommerce_product_variations = self.woocommerce_api_get_all_items(woocommerce_api, endpoint=f'products/{woocommerce_product["id"]}/variations', search_parameters=search_parameters)
+                    woocommerce_product_variations = self.woocommerce_api_get_all_items(endpoint=f'products/{woocommerce_product["id"]}/variations', search_parameters=search_parameters)
 
                     for product_variation in woocommerce_product_variations:
                         product_variation_values = self.woocommerce_product_variation_fields(
@@ -1414,7 +1434,13 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing product {woocommerce_product["id"]}: {error}')
 
-    def woocommerce_to_odoo_customers_sync(self: models.Model, woocommerce_api: API) -> None:
+    def woocommerce_to_odoo_customers_sync(self: models.Model) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            error_message = 'WooCommerce REST API connection failed.'
+            _logger.error(error_message)
+            raise UserError(_(error_message))
+
         # WooCommerce REST API parameters
         search_parameters = {}
 
@@ -1424,7 +1450,7 @@ class WoocommerceConnector(models.Model):
                 search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
 
         # WooCommerce customers
-        woocommerce_customers = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='customers', search_parameters=search_parameters)
+        woocommerce_customers = self.woocommerce_api_get_all_items(endpoint='customers', search_parameters=search_parameters)
 
         # Get all Odoo partners with WooCommerce customer ID
         odoo_customers = self.env['res.partner'].search_read(
@@ -1577,7 +1603,13 @@ class WoocommerceConnector(models.Model):
                 self.env.cr.rollback()
                 _logger.exception(f'Error syncing customer {woocommerce_customer["id"]}: {error}')
 
-    def woocommerce_to_odoo_orders_sync(self: models.Model, woocommerce_api: API, woocommerce_tax_rates: dict[str, float], woocommerce_weight_unit: str, woocommerce_shipping_methods: list[dict[str, Any]]) -> None:
+    def woocommerce_to_odoo_orders_sync(self: models.Model, woocommerce_tax_rates: dict[str, float], woocommerce_weight_unit: str, woocommerce_shipping_methods: list[dict[str, Any]]) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            error_message = 'WooCommerce REST API connection failed.'
+            _logger.error(error_message)
+            raise UserError(_(error_message))
+
         # WooCommerce REST API parameters
         search_parameters = {'status': ','.join(self.settings_woocommerce_order_status.mapped('status')) or 'any'}
 
@@ -1587,7 +1619,7 @@ class WoocommerceConnector(models.Model):
                 search_parameters['modified_after'] = woocommerce_last_execution_datetime.strftime('%Y-%m-%dT%H:%M:%S')  # ISO 8601 date format
 
         # WooCommerce orders
-        woocommerce_orders = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='orders', search_parameters=search_parameters)
+        woocommerce_orders = self.woocommerce_api_get_all_items(endpoint='orders', search_parameters=search_parameters)
 
         # Get all Odoo sale orders with WooCommerce order ID
         odoo_sale_orders = self.env['sale.order'].search_read(
@@ -2025,7 +2057,7 @@ class WoocommerceConnector(models.Model):
         if language_code is not None:
             search_parameters['lang'] = language_code
 
-        woocommerce_attribute_values = self.woocommerce_api_get_all_items(woocommerce_api, endpoint=f'products/{attribute_type}', search_parameters=search_parameters)
+        woocommerce_attribute_values = self.woocommerce_api_get_all_items(endpoint=f'products/{attribute_type}', search_parameters=search_parameters)
         if woocommerce_attribute_values:
             return woocommerce_attribute_values[0]
         else:
@@ -2037,13 +2069,18 @@ class WoocommerceConnector(models.Model):
 
     def odoo_to_woocommerce_products_sync(
         self: models.Model,
-        woocommerce_api: API,
         woocommerce_currency: str,
         woocommerce_tax_rates: dict[str, float],
         woocommerce_product_prices_include_tax: bool,
         woocommerce_weight_unit: str,
         woocommerce_dimension_unit: str,
     ) -> None:
+        woocommerce_api = self.woocommerce_api_get()
+        if not woocommerce_api:
+            error_message = 'WooCommerce REST API connection failed.'
+            _logger.error(error_message)
+            raise UserError(_(error_message))
+
         # Odoo search conditions
         search_conditions = [('active', '=', True), ('product_sync_to_woocommerce', '=', True), ('default_code', '!=', False)]
 
@@ -2063,7 +2100,7 @@ class WoocommerceConnector(models.Model):
         if odoo_products_default_code:
             search_parameters['sku'] = ','.join(odoo_products_default_code)
 
-        woocommerce_products = self.woocommerce_api_get_all_items(woocommerce_api, endpoint='products', search_parameters=search_parameters)
+        woocommerce_products = self.woocommerce_api_get_all_items(endpoint='products', search_parameters=search_parameters)
         woocommerce_products = {woocommerce_product['sku']: woocommerce_product for woocommerce_product in woocommerce_products}
 
         for odoo_product in odoo_products:
@@ -2198,7 +2235,7 @@ class WoocommerceConnector(models.Model):
                     # For variable products, handle variations
                     if product_values.get('type') == 'variable':
                         # Retrieve existing variations from WooCommerce
-                        woocommerce_product_variations = self.woocommerce_api_get_all_items(woocommerce_api, endpoint=f'products/{woocommerce_product["id"]}/variations', search_parameters={'status': 'publish'})
+                        woocommerce_product_variations = self.woocommerce_api_get_all_items(endpoint=f'products/{woocommerce_product["id"]}/variations', search_parameters={'status': 'publish'})
 
                         # Build a mapping by SKU for easier lookup
                         variations_by_sku = {variation.get('sku'): variation for variation in woocommerce_product_variations if variation.get('sku')}
